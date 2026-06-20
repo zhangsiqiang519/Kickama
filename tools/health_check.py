@@ -68,8 +68,9 @@ MEMORY_THRESHOLD_CRITICAL = 90
 # CHECK FUNCTIONS
 # ---------------------------------------------------------------------------
 
-def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[str, str, int]:
+def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[str, str, int, float]:
     import http.client
+    start = time.time()
     try:
         conn = http.client.HTTPConnection(host, port, timeout=timeout)
         conn.request("GET", path)
@@ -77,6 +78,7 @@ def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[s
         status = resp.status
         body = resp.read().decode("utf-8", errors="replace")[:200]
         conn.close()
+        latency = (time.time() - start) * 1000
 
         if status == 200:
             result = "OK"
@@ -88,9 +90,10 @@ def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[s
             result = "CRITICAL"
             detail = f"HTTP {status}: {body[:100]}"
 
-        return result, detail, status
+        return result, detail, status, latency
     except Exception as e:
-        return "CRITICAL", str(e), 0
+        latency = (time.time() - start) * 1000
+        return "CRITICAL", str(e), 0, latency
 
 
 def check_tcp_port(host: str, port: int, timeout: int) -> Tuple[str, str, float]:
@@ -216,13 +219,14 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
     for name, config in SERVICES.items():
         if service and name != service:
             continue
-        status, detail, code = check_http_service(
+        status, detail, code, latency = check_http_service(
             config["host"], config["port"], config["path"], config["timeout"]
         )
         results["services"][name] = {
             "status": status,
             "detail": detail,
             "code": code,
+            "latency_ms": latency,
             "endpoint": f"http://{config['host']}:{config['port']}{config['path']}",
         }
         if status == "CRITICAL":
@@ -236,6 +240,7 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
         results["infrastructure"][name] = {
             "status": status,
             "detail": detail,
+            "latency_ms": latency,
             "endpoint": f"{config['host']}:{config['port']}",
         }
         if status == "CRITICAL":
@@ -300,9 +305,74 @@ def print_health_report(results: Dict[str, Any]):
     print()
 
 
+def prometheus_label(value: Any) -> str:
+    return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace("\"", "\\\"")
+
+
+def prometheus_labels(**labels: Any) -> str:
+    return ",".join(f'{key}="{prometheus_label(value)}"' for key, value in labels.items())
+
+
+def status_up(status: str) -> int:
+    return 1 if status == "OK" else 0
+
+
+def timestamp_seconds(value: str) -> int:
+    try:
+        parsed = datetime.fromisoformat(value)
+        return int(parsed.timestamp())
+    except ValueError:
+        return int(time.time())
+
+
+def format_prometheus_report(results: Dict[str, Any]) -> str:
+    lines = [
+        "# HELP kickama_health_check_timestamp_seconds Unix timestamp for this health check run.",
+        "# TYPE kickama_health_check_timestamp_seconds gauge",
+        f"kickama_health_check_timestamp_seconds {timestamp_seconds(results['timestamp'])}",
+        "# HELP kickama_health_overall_up Overall health status, 1 when OK and 0 when degraded.",
+        "# TYPE kickama_health_overall_up gauge",
+        f"kickama_health_overall_up {1 if results['overall_status'] == 'OK' else 0}",
+        "# HELP kickama_health_service_up Service health status, 1 when OK and 0 otherwise.",
+        "# TYPE kickama_health_service_up gauge",
+        "# HELP kickama_health_service_latency_ms Service health check latency in milliseconds.",
+        "# TYPE kickama_health_service_latency_ms gauge",
+        "# HELP kickama_health_service_http_status_code HTTP status code returned by service health checks.",
+        "# TYPE kickama_health_service_http_status_code gauge",
+    ]
+
+    for name, check in sorted(results["services"].items()):
+        labels = prometheus_labels(service=name, endpoint=check.get("endpoint", ""))
+        lines.append(f"kickama_health_service_up{{{labels}}} {status_up(check['status'])}")
+        lines.append(f"kickama_health_service_latency_ms{{{labels}}} {float(check.get('latency_ms', 0)):.3f}")
+        lines.append(f"kickama_health_service_http_status_code{{{labels}}} {int(check.get('code', 0))}")
+
+    lines.extend([
+        "# HELP kickama_health_infrastructure_up Infrastructure health status, 1 when OK and 0 otherwise.",
+        "# TYPE kickama_health_infrastructure_up gauge",
+        "# HELP kickama_health_infrastructure_latency_ms Infrastructure check latency in milliseconds.",
+        "# TYPE kickama_health_infrastructure_latency_ms gauge",
+    ])
+    for name, check in sorted(results["infrastructure"].items()):
+        labels = prometheus_labels(component=name, endpoint=check.get("endpoint", ""))
+        lines.append(f"kickama_health_infrastructure_up{{{labels}}} {status_up(check['status'])}")
+        lines.append(f"kickama_health_infrastructure_latency_ms{{{labels}}} {float(check.get('latency_ms', 0)):.3f}")
+
+    lines.extend([
+        "# HELP kickama_health_system_up System check status, 1 when OK and 0 otherwise.",
+        "# TYPE kickama_health_system_up gauge",
+    ])
+    for name, check in sorted(results["system"].items()):
+        labels = prometheus_labels(check=name)
+        lines.append(f"kickama_health_system_up{{{labels}}} {status_up(check['status'])}")
+
+    return "\n".join(lines) + "\n"
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Health check tool")
     parser.add_argument("--service", "-s", help="Check specific service only")
+    parser.add_argument("--format", choices=["text", "json", "prometheus"], default="text", help="Output format")
     parser.add_argument("--json", "-j", action="store_true", help="JSON output")
     parser.add_argument("--watch", "-w", action="store_true", help="Continuous monitoring")
     parser.add_argument("--interval", "-i", type=int, default=30, help="Check interval in seconds")
@@ -312,31 +382,39 @@ def parse_args():
 
 def main():
     args = parse_args()
+    output_format = "json" if args.json else args.format
 
     if args.watch:
         print(f"Continuous monitoring (interval: {args.interval}s). Press Ctrl+C to stop.")
         try:
             while True:
-                results = run_health_checks(args.service, args.json)
-                if args.json:
+                results = run_health_checks(args.service, output_format == "json")
+                if output_format == "json":
                     print(json.dumps(results, indent=2))
+                elif output_format == "prometheus":
+                    print(format_prometheus_report(results), end="")
                 else:
                     print_health_report(results)
                 time.sleep(args.interval)
         except KeyboardInterrupt:
             print("\nMonitoring stopped")
     else:
-        results = run_health_checks(args.service, args.json)
-        if args.json:
+        results = run_health_checks(args.service, output_format == "json")
+        if output_format == "json":
             output = json.dumps(results, indent=2)
             print(output)
+        elif output_format == "prometheus":
+            output = format_prometheus_report(results)
+            print(output, end="")
         else:
             print_health_report(results)
 
         if args.output:
             with open(args.output, "w") as f:
-                if args.json:
+                if output_format == "json":
                     json.dump(results, f, indent=2)
+                elif output_format == "prometheus":
+                    f.write(format_prometheus_report(results))
                 else:
                     json.dump(results, f, indent=2)
             print(f"Report saved to {args.output}")
@@ -348,4 +426,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
