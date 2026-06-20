@@ -37,6 +37,30 @@ The health check returns a 200 OK response with a JSON body:
 }
 ```
 
+### HTTP Probe Retry and Circuit Breaker
+
+`tools/health_check.py` can retry transient HTTP probe failures and avoid
+hammering endpoints that keep failing.
+
+```sh
+python3 tools/health_check.py --service backend \
+  --max-retries 3 \
+  --backoff-factor 2 \
+  --circuit-threshold 4 \
+  --circuit-cooldown 60
+```
+
+Retry delays use exponential backoff:
+
+```text
+delay = base_delay * (backoff_factor ^ attempt)
+```
+
+The default base delay is 1 second. A circuit opens after the configured number
+of consecutive HTTP probe failures and stays open until the cooldown expires.
+JSON and text output include summary counts for OK, WARNING, CRITICAL, and open
+circuits.
+
 ### Prometheus Metrics
 
 Each service exposes Prometheus metrics at `/metrics` on the same port as the
